@@ -10,11 +10,26 @@ import json
 import os
 import re
 import smtplib
+from dataclasses import dataclass
 from email.message import EmailMessage
 from pathlib import Path
 
 
 EMAIL_SPLIT_RE = re.compile(r"[,;\s]+")
+RATING_LABELS = {
+    "kobo": "Kobo",
+    "books_com": "博客來",
+    "readmoo": "讀墨",
+    "goodreads": "Goodreads",
+    "amazon_com": "Amazon",
+}
+
+
+@dataclass(frozen=True)
+class InlineImage:
+    cid: str
+    path: Path
+    subtype: str
 
 
 def _env(name: str, default: str = "") -> str:
@@ -46,6 +61,46 @@ def _rating(book: dict) -> str:
     return f"{score:.2f}" if isinstance(score, int | float) else "-"
 
 
+def _image_subtype(path: Path) -> str:
+    suffix = path.suffix.lower().lstrip(".")
+    return "jpeg" if suffix in {"jpg", "jpeg"} else suffix or "jpeg"
+
+
+def _cover_src(book: dict, idx: int, data_path: Path, images: list[InlineImage]) -> str:
+    cover_url = str(book.get("cover_url") or "").strip()
+    if not cover_url:
+        return ""
+    if cover_url.startswith(("http://", "https://")):
+        return html.escape(cover_url, quote=True)
+
+    cover_path = data_path.parent.parent / cover_url
+    if not cover_path.exists():
+        return ""
+
+    cid = f"kobo99-cover-{idx}"
+    images.append(InlineImage(cid=cid, path=cover_path, subtype=_image_subtype(cover_path)))
+    return f"cid:{cid}"
+
+
+def _rating_rows(book: dict) -> str:
+    rows = []
+    ratings = book.get("ratings") or {}
+    for key, label in RATING_LABELS.items():
+        rating = ratings.get(key) or {}
+        score = rating.get("score")
+        count = rating.get("count", 0)
+        score_text = f"{score:.1f}" if isinstance(score, int | float) else "暫無評分"
+        count_text = str(count) if count else ""
+        rows.append(
+            "<tr>"
+            f'<td style="padding:2px 10px 2px 0;color:#555;font-size:13px;">{label}</td>'
+            f'<td style="padding:2px 10px;color:#0b9b8a;font-size:13px;font-weight:700;text-align:right;">{score_text}</td>'
+            f'<td style="padding:2px 0;color:#999;font-size:12px;text-align:right;">{count_text}</td>'
+            "</tr>"
+        )
+    return "".join(rows)
+
+
 def build_plain_text(data: dict) -> str:
     lines = [
         f"Kobo 99 書單：{data.get('year')}-W{int(data.get('week', 0)):02d}",
@@ -57,6 +112,7 @@ def build_plain_text(data: dict) -> str:
         lines.extend(
             [
                 f"{idx}. {book.get('title', '')}",
+                f"   原文：{book.get('original_title') or '-'}",
                 f"   作者：{book.get('author') or '-'}",
                 f"   綜合評分：{_rating(book)}",
                 f"   Kobo：{book.get('kobo_url') or '-'}",
@@ -66,50 +122,97 @@ def build_plain_text(data: dict) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
-def build_html(data: dict) -> str:
+def build_html(data: dict, data_path: Path) -> tuple[str, list[InlineImage]]:
     year = html.escape(str(data.get("year", "")))
     week = int(data.get("week", 0))
     sale_label = html.escape(str(data.get("sale_label", "")))
     kobo_url = html.escape(str(data.get("kobo_url", "")), quote=True)
+    images: list[InlineImage] = []
 
-    rows = []
+    cards = []
     for idx, book in enumerate(data.get("books", []), 1):
         title = html.escape(str(book.get("title", "")))
+        original_title = html.escape(str(book.get("original_title") or ""))
         author = html.escape(str(book.get("author") or "-"))
         rating = html.escape(_rating(book))
         url = html.escape(str(book.get("kobo_url") or ""), quote=True)
-        rows.append(
-            "<tr>"
-            f"<td style=\"padding:8px;border-bottom:1px solid #ddd;vertical-align:top;\">{idx}</td>"
-            f"<td style=\"padding:8px;border-bottom:1px solid #ddd;vertical-align:top;\"><a href=\"{url}\">{title}</a></td>"
-            f"<td style=\"padding:8px;border-bottom:1px solid #ddd;vertical-align:top;\">{author}</td>"
-            f"<td style=\"padding:8px;border-bottom:1px solid #ddd;vertical-align:top;text-align:right;\">{rating}</td>"
-            "</tr>"
+        date = html.escape(str(book.get("date") or ""))
+        sale_price = html.escape(str(book.get("sale_price") or "NT$99"))
+        original_price = html.escape(str(book.get("kobo_price") or ""))
+        ratings_html = _rating_rows(book)
+        cover_src = _cover_src(book, idx, data_path, images)
+        cover_html = (
+            f'<img src="{cover_src}" alt="{title}" width="96" '
+            'style="display:block;width:96px;max-width:96px;border:0;border-radius:4px;">'
+            if cover_src else ""
+        )
+        original_title_html = (
+            f'<div style="color:#888;font-size:13px;font-style:italic;line-height:1.35;margin-top:4px;">{original_title}</div>'
+            if original_title else ""
+        )
+        original_price_html = (
+            f'<span style="color:#999;text-decoration:line-through;font-size:13px;margin-left:8px;">{original_price}</span>'
+            if original_price else ""
+        )
+        cards.append(
+            f"""\
+        <tr>
+          <td style="padding:14px 0;border-bottom:1px solid #e8e2d9;">
+            <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+              <tr>
+                <td width="112" valign="top" style="width:112px;padding-right:16px;">{cover_html}</td>
+                <td valign="top">
+                  <div style="color:#666;font-size:13px;font-weight:700;margin-bottom:6px;">{date}</div>
+                  <div style="font-size:17px;font-weight:700;line-height:1.45;color:#222;">《{title}》</div>
+                  {original_title_html}
+                  <div style="color:#555;font-size:14px;margin-top:8px;">{author}</div>
+                  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;margin-top:10px;max-width:360px;">
+                    {ratings_html}
+                  </table>
+                  <div style="margin-top:12px;">
+                    <span style="color:#0b9b8a;font-size:20px;font-weight:800;">{sale_price}</span>{original_price_html}
+                    <span style="float:right;background:#fff1f1;color:#b42318;border-radius:6px;padding:3px 8px;font-weight:700;">{rating}</span>
+                  </div>
+                  <div style="margin-top:12px;">
+                    <a href="{url}" style="background:#0b9b8a;color:#fff;text-decoration:none;border-radius:7px;padding:8px 14px;display:inline-block;font-weight:700;">立即購買</a>
+                  </div>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>"""
         )
 
-    return f"""\
+    body = f"""\
 <!doctype html>
 <html>
-  <body style="font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.5;">
-    <h1 style="font-size:20px;margin:0 0 8px;">Kobo 99 書單：{year}-W{week:02d}</h1>
-    <p style="margin:0 0 12px;">{sale_label}</p>
-    <p style="margin:0 0 16px;"><a href="{kobo_url}">Kobo 官方書單</a></p>
-    <table style="border-collapse:collapse;width:100%;max-width:960px;">
-      <thead>
-        <tr>
-          <th align="left" style="padding:8px;border-bottom:2px solid #333;">#</th>
-          <th align="left" style="padding:8px;border-bottom:2px solid #333;">書名</th>
-          <th align="left" style="padding:8px;border-bottom:2px solid #333;">作者</th>
-          <th align="right" style="padding:8px;border-bottom:2px solid #333;">綜合評分</th>
-        </tr>
-      </thead>
-      <tbody>
-        {''.join(rows)}
-      </tbody>
+  <body style="margin:0;padding:0;background:#f6f1ea;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;line-height:1.5;color:#222;">
+    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;background:#f6f1ea;">
+      <tr>
+        <td align="center" style="padding:24px 12px;">
+          <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;max-width:720px;background:#fff;border:1px solid #eadfd3;border-radius:10px;">
+            <tr>
+              <td style="padding:22px 22px 6px;">
+                <h1 style="font-size:22px;line-height:1.25;margin:0 0 8px;color:#111;">Kobo 99 書單：{year}-W{week:02d}</h1>
+                <p style="margin:0 0 10px;color:#555;">{sale_label}</p>
+                <p style="margin:0;"><a href="{kobo_url}" style="color:#0b7f72;text-decoration:none;font-weight:700;">Kobo 官方書單</a></p>
+              </td>
+            </tr>
+            <tr>
+              <td style="padding:0 22px 12px;">
+                <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-collapse:collapse;">
+                  {''.join(cards)}
+                </table>
+              </td>
+            </tr>
+          </table>
+        </td>
+      </tr>
     </table>
   </body>
 </html>
 """
+    return body, images
 
 
 def send_email(data: dict, recipients: list[str], args: argparse.Namespace) -> None:
@@ -123,7 +226,19 @@ def send_email(data: dict, recipients: list[str], args: argparse.Namespace) -> N
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
     msg.set_content(build_plain_text(data))
-    msg.add_alternative(build_html(data), subtype="html")
+    html_body, inline_images = build_html(data, args.data)
+    msg.add_alternative(html_body, subtype="html")
+
+    html_part = msg.get_payload()[1]
+    for image in inline_images:
+        with image.path.open("rb") as f:
+            html_part.add_related(
+                f.read(),
+                maintype="image",
+                subtype=image.subtype,
+                cid=f"<{image.cid}>",
+                filename=image.path.name,
+            )
 
     if not args.smtp_host:
         raise ValueError("SMTP_HOST is required.")
