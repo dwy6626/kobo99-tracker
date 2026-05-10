@@ -1,0 +1,54 @@
+name: 抓 Kobo 99 書單並寄信
+
+on:
+  schedule:
+    # 每週四 02:00 UTC = 台灣時間 10:00
+    # 失敗會每小時重試最多 4 次，覆蓋到 13:00
+    - cron: "0 2 * * 4"
+
+jobs:
+  fetch-and-email:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout 專案
+        uses: actions/checkout@v4
+
+      - name: 設定 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: scraper/requirements.txt
+
+      - name: 安裝 Python 套件
+        run: pip install -r scraper/requirements.txt
+
+      - name: 安裝 Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: 執行爬蟲（含重試，每小時一次最多 4 次）
+        run: |
+          MAX=4
+          for i in $(seq 1 $MAX); do
+            echo "=== 第 $i 次嘗試 ==="
+            python scraper/scrape.py && break
+            if [ $i -lt $MAX ]; then
+              echo "部落格文章尚未發佈，等待 60 分鐘後重試..."
+              sleep 3600
+            else
+              echo "已達最大重試次數，放棄"
+              exit 1
+            fi
+          done
+
+      - name: 寄出書單 email
+        env:
+          EMAIL_RECIPIENTS: ${{ vars.EMAIL_RECIPIENTS || secrets.EMAIL_RECIPIENTS }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          SMTP_FROM: ${{ secrets.SMTP_FROM }}
+          EMAIL_SUBJECT_PREFIX: ${{ vars.EMAIL_SUBJECT_PREFIX || 'Kobo 99 書單' }}
+        run: python scraper/email_weekly_books.py
